@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import catalog, handoff, protocol, store
+from . import catalog, events, handoff, protocol, store
 from .normalize import ObservationError, normalize_batch, parse_time
 
 
@@ -109,6 +109,8 @@ def ingest_packet(connection: sqlite3.Connection, packet: protocol.Packet, *, wh
             for observation in normalized:
                 observation_id = store.insert_observation(connection, batch_id, station_id, observation.as_dict())
                 handoff_count += handoff.route_observation(connection, observation_id, observation, timestamp)
+                event_id = events.create_singleton_event(connection, observation_id, observation.region, timestamp)
+                events.arrange_event_duties(connection, event_id, timestamp)
             store.update_cursor(connection, station_id, sequence, batch_id, timestamp)
             store.record_activity(connection, "batch_committed", "batch", str(batch_id), timestamp,
                                   {"station_id": station_id, "sequence": sequence,

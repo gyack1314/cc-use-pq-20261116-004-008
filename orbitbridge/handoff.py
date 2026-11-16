@@ -49,7 +49,39 @@ def acknowledge(connection: sqlite3.Connection, handoff_id: int, operator: str, 
             raise HandoffError("acknowledge_conflict", "确认状态冲突")
         store.record_activity(connection, "handoff_acknowledged", "handoff", str(handoff_id), timestamp,
                               {"operator": operator.strip()})
+        _reconcile_duty_for_handoff(connection, item["observation_id"], item["subscription_id"], timestamp)
     return {"status": "acknowledged", **store.get_handoff(connection, handoff_id)}
+
+
+def _reconcile_duty_for_handoff(connection, observation_id: int, subscription_id: str, when: str) -> None:
+    """单条义务确认后，收敛包含它的当前 pending 事件待办。
+
+    若该待办快照中已无 pending 义务，则把待办一并标记确认（确认人为最后操作者），
+    保证底层义务与事件待办两套状态不脱节。
+    """
+    from . import events
+    event_id = events.current_event_id(connection, observation_id)
+    if event_id is None:
+        return
+    for duty in store.many(
+        connection,
+        "SELECT d.duty_id FROM event_duties d WHERE d.event_id=? AND d.subscription_id=? AND d.status='pending'",
+        (event_id, subscription_id),
+    ):
+        remaining = connection.execute(
+            "SELECT COUNT(*) FROM duty_observations do2 JOIN handoffs h USING(handoff_id) "
+            "WHERE do2.duty_id=? AND h.status='pending'", (duty["duty_id"],)).fetchone()[0]
+        if remaining == 0:
+            operator = store.one(
+                connection,
+                "SELECT operator FROM handoffs WHERE observation_id=? AND subscription_id=? "
+                "ORDER BY acknowledged_at DESC LIMIT 1", (observation_id, subscription_id))
+            connection.execute(
+                "UPDATE event_duties SET status='acknowledged',acknowledged_at=?,operator=? WHERE duty_id=?",
+                (when, operator["operator"] if operator else "system", duty["duty_id"]))
+            store.record_activity(connection, "duty_acknowledged", "duty", str(duty["duty_id"]), when,
+                                  {"operator": operator["operator"] if operator else "system",
+                                   "reason": "reconciled_from_handoff"})
 
 
 def list_handoffs(connection: sqlite3.Connection, *, subscription_id: str | None = None,

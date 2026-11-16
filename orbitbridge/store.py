@@ -40,13 +40,71 @@ CREATE INDEX IF NOT EXISTS observations_region ON observations(region, observed_
 CREATE TABLE IF NOT EXISTS handoffs (
   handoff_id INTEGER PRIMARY KEY AUTOINCREMENT, observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
   subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
-  status TEXT NOT NULL CHECK(status IN ('pending','acknowledged')),
+  status TEXT NOT NULL CHECK(status IN ('pending','acknowledged','withdrawn')),
   created_at TEXT NOT NULL, acknowledged_at TEXT, operator TEXT,
   UNIQUE(observation_id, subscription_id),
   CHECK((status='pending' AND acknowledged_at IS NULL AND operator IS NULL) OR
-        (status='acknowledged' AND acknowledged_at IS NOT NULL AND operator IS NOT NULL))
+        (status='acknowledged' AND acknowledged_at IS NOT NULL AND operator IS NOT NULL) OR
+        (status='withdrawn' AND acknowledged_at IS NULL AND operator IS NULL))
 );
 CREATE INDEX IF NOT EXISTS handoffs_status ON handoffs(status, subscription_id);
+CREATE TABLE IF NOT EXISTS events (
+  event_id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, status TEXT NOT NULL
+    CHECK(status IN ('active','absorbed')), created_at TEXT NOT NULL, absorbed_at TEXT,
+  absorbed_into INTEGER REFERENCES events(event_id)
+);
+CREATE INDEX IF NOT EXISTS events_region ON events(region, status);
+CREATE TABLE IF NOT EXISTS event_memberships (
+  membership_id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL REFERENCES events(event_id),
+  observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
+  change_type TEXT NOT NULL CHECK(change_type IN ('joined','left')), reason_code TEXT NOT NULL,
+  changed_at TEXT NOT NULL, operator TEXT, left_event_id INTEGER REFERENCES events(event_id),
+  UNIQUE(membership_id, change_type)
+);
+CREATE INDEX IF NOT EXISTS memberships_observation ON event_memberships(observation_id, membership_id);
+CREATE INDEX IF NOT EXISTS memberships_event ON event_memberships(event_id, membership_id);
+CREATE TABLE IF NOT EXISTS event_lineage (
+  lineage_id INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT NOT NULL
+    CHECK(operation IN ('created','merged','split','corrected')),
+  from_event_id INTEGER REFERENCES events(event_id), to_event_id INTEGER REFERENCES events(event_id),
+  occurred_at TEXT NOT NULL, operator TEXT, reason TEXT, details_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lineage_from ON event_lineage(from_event_id, lineage_id);
+CREATE INDEX IF NOT EXISTS lineage_to ON event_lineage(to_event_id, lineage_id);
+CREATE TABLE IF NOT EXISTS event_duties (
+  duty_id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL REFERENCES events(event_id),
+  subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  status TEXT NOT NULL CHECK(status IN ('pending','acknowledged','superseded')),
+  created_at TEXT NOT NULL, acknowledged_at TEXT, operator TEXT,
+  UNIQUE(event_id, subscription_id, generation),
+  CHECK((status='pending' AND acknowledged_at IS NULL AND operator IS NULL) OR
+        (status='acknowledged' AND acknowledged_at IS NOT NULL AND operator IS NOT NULL) OR
+        (status='superseded' AND acknowledged_at IS NULL AND operator IS NULL))
+);
+CREATE INDEX IF NOT EXISTS duties_status ON event_duties(status, subscription_id);
+CREATE INDEX IF NOT EXISTS duties_event ON event_duties(event_id, generation);
+CREATE TABLE IF NOT EXISTS duty_observations (
+  duty_id INTEGER NOT NULL REFERENCES event_duties(duty_id),
+  observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
+  handoff_id INTEGER NOT NULL REFERENCES handoffs(handoff_id),
+  was_pending INTEGER NOT NULL CHECK(was_pending IN (0,1)),
+  PRIMARY KEY(duty_id, observation_id)
+);
+CREATE INDEX IF NOT EXISTS duty_observations_observation ON duty_observations(observation_id);
+CREATE TABLE IF NOT EXISTS event_proposals (
+  proposal_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('merge','split')),
+  status TEXT NOT NULL CHECK(status IN ('proposed','confirmed','cancelled')),
+  payload_json TEXT NOT NULL, reason TEXT NOT NULL, operator TEXT NOT NULL,
+  created_at TEXT NOT NULL, decided_at TEXT, resulting_event_ids_json TEXT
+);
+CREATE INDEX IF NOT EXISTS proposals_status ON event_proposals(status, proposal_id);
+CREATE TABLE IF NOT EXISTS observation_corrections (
+  correction_id INTEGER PRIMARY KEY AUTOINCREMENT, observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
+  field_name TEXT NOT NULL, old_value TEXT NOT NULL, new_value TEXT NOT NULL,
+  reason TEXT NOT NULL, operator TEXT NOT NULL, corrected_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS corrections_observation ON observation_corrections(observation_id, correction_id);
 CREATE TABLE IF NOT EXISTS quarantine (
   quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT, station_id TEXT, sequence INTEGER, source_name TEXT NOT NULL,
   content_digest TEXT NOT NULL, reason_code TEXT NOT NULL, detail TEXT NOT NULL,
@@ -61,6 +119,79 @@ CREATE INDEX IF NOT EXISTS activity_entity ON activity(entity_type, entity_id, a
 """
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """升级既有数据库：handoffs 增加 withdrawn 状态，事件层表由 SCHEMA 幂等创建。"""
+    constraint = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='handoffs'").fetchone()
+    if constraint is None or "withdrawn" in constraint[0]:
+        return
+    # 重命名基表期间临时关闭外键，避免 schema 缓存指向旧表名
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE handoffs RENAME TO handoffs_legacy;
+            CREATE TABLE handoffs (
+              handoff_id INTEGER PRIMARY KEY AUTOINCREMENT, observation_id INTEGER NOT NULL
+                REFERENCES observations(observation_id),
+              subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+              status TEXT NOT NULL CHECK(status IN ('pending','acknowledged','withdrawn')),
+              created_at TEXT NOT NULL, acknowledged_at TEXT, operator TEXT,
+              UNIQUE(observation_id, subscription_id),
+              CHECK((status='pending' AND acknowledged_at IS NULL AND operator IS NULL) OR
+                    (status='acknowledged' AND acknowledged_at IS NOT NULL AND operator IS NOT NULL) OR
+                    (status='withdrawn' AND acknowledged_at IS NULL AND operator IS NULL))
+            );
+            INSERT INTO handoffs(handoff_id,observation_id,subscription_id,status,created_at,acknowledged_at,operator)
+              SELECT handoff_id,observation_id,subscription_id,status,created_at,acknowledged_at,operator FROM handoffs_legacy;
+            DROP TABLE handoffs_legacy;
+            CREATE INDEX IF NOT EXISTS handoffs_status ON handoffs(status, subscription_id);
+            """
+        )
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _backfill_event_layer(connection: sqlite3.Connection) -> None:
+    """为事件层出现之前的历史观测回填单例事件、成员、血缘与待办代际。"""
+    legacy = connection.execute(
+        "SELECT o.observation_id,o.region,b.received_at FROM observations o JOIN batches b ON b.batch_id=o.batch_id "
+        "WHERE NOT EXISTS(SELECT 1 FROM event_memberships m WHERE m.observation_id=o.observation_id) "
+        "ORDER BY o.observation_id").fetchall()
+    for row in legacy:
+        when = row["received_at"]
+        cursor = connection.execute(
+            "INSERT INTO events(region,status,created_at) VALUES(?,'active',?)", (row["region"], when))
+        event_id = int(cursor.lastrowid)
+        member_cursor = connection.execute(
+            "INSERT INTO event_memberships(event_id,observation_id,change_type,reason_code,changed_at,operator) "
+            "VALUES(?,?,'joined','backfilled',?,?)", (event_id, row["observation_id"], when, "migration"))
+        membership_id = int(member_cursor.lastrowid)
+        connection.execute(
+            "INSERT INTO event_lineage(operation,from_event_id,to_event_id,occurred_at,operator,reason,details_json) "
+            "VALUES('created',NULL,?,?,?,?,?)",
+            (event_id, when, "migration", "backfilled",
+             json.dumps({"observation_id": row["observation_id"], "membership_id": membership_id})))
+        # 为每条历史 handoff 建立对应代际：pending 的留待值守，acknowledged 的保留责任快照
+        for handoff_row in connection.execute(
+                "SELECT * FROM handoffs WHERE observation_id=? ORDER BY handoff_id", (row["observation_id"],)):
+            existing = connection.execute(
+                "SELECT 1 FROM event_duties WHERE event_id=? AND subscription_id=?",
+                (event_id, handoff_row["subscription_id"])).fetchone()
+            if existing:
+                continue
+            duty_cursor = connection.execute(
+                "INSERT INTO event_duties(event_id,subscription_id,generation,status,created_at,"
+                "acknowledged_at,operator) VALUES(?,?,1,?,?,?,?)",
+                (event_id, handoff_row["subscription_id"], handoff_row["status"], when,
+                 handoff_row["acknowledged_at"], handoff_row["operator"]))
+            duty_id = int(duty_cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO duty_observations(duty_id,observation_id,handoff_id,was_pending) VALUES(?,?,?,?)",
+                (duty_id, row["observation_id"], handoff_row["handoff_id"],
+                 int(handoff_row["status"] == "pending")))
+
+
 def open_database(path: str | Path) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +200,10 @@ def open_database(path: str | Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=10000")
     connection.execute("PRAGMA journal_mode=WAL")
+    # 先迁移旧 handoffs（此时尚无事件层外键引用），再幂等创建含事件层的完整 schema
+    _migrate(connection)
     connection.executescript(SCHEMA)
+    _backfill_event_layer(connection)
     return connection
 
 
@@ -171,7 +305,9 @@ def get_handoff(connection: sqlite3.Connection, handoff_id: int) -> dict[str, An
 
 
 def counts(connection: sqlite3.Connection) -> dict[str, int]:
-    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "quarantine", "activity")
+    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "events",
+             "event_memberships", "event_lineage", "event_duties", "duty_observations",
+             "event_proposals", "observation_corrections", "quarantine", "activity")
     return {name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
 
 
@@ -193,4 +329,32 @@ def integrity_check(connection: sqlite3.Connection) -> list[str]:
     ):
         if row["record_count"] != row["actual"]:
             issues.append(f"batch_count:{row['batch_id']}")
+    # 每条观测在任一时刻最多属于一个事件：joined 与 left 必须配对且数量一致
+    for row in connection.execute(
+        "SELECT observation_id FROM event_memberships GROUP BY observation_id "
+        "HAVING SUM(change_type='joined') <> SUM(change_type='left') + 1"
+    ):
+        issues.append(f"membership_unbalanced:{row['observation_id']}")
+    # 当前（最后一次为 joined）成员只能挂在 active 事件上
+    for row in connection.execute(
+        "SELECT m.observation_id,m.event_id FROM event_memberships m JOIN events e USING(event_id) "
+        "WHERE m.membership_id=(SELECT MAX(membership_id) FROM event_memberships WHERE observation_id=m.observation_id) "
+        "AND m.change_type='joined' AND e.status<>'active'"
+    ):
+        issues.append(f"member_on_inactive_event:{row['observation_id']}")
+    # active 事件至少有一名当前成员
+    for row in connection.execute(
+        "SELECT e.event_id FROM events e WHERE e.status='active' AND NOT EXISTS("
+        "SELECT 1 FROM event_memberships m WHERE m.event_id=e.event_id AND m.change_type='joined' "
+        "AND NOT EXISTS(SELECT 1 FROM event_memberships x WHERE x.observation_id=m.observation_id "
+        "AND x.change_type='left' AND x.membership_id>m.membership_id))"
+    ):
+        issues.append(f"empty_active_event:{row['event_id']}")
+    # pending 事件待办必须仍有未履行义务（pending 交接）
+    for row in connection.execute(
+        "SELECT d.duty_id FROM event_duties d WHERE d.status='pending' AND NOT EXISTS("
+        "SELECT 1 FROM duty_observations do2 JOIN handoffs h USING(handoff_id) "
+        "WHERE do2.duty_id=d.duty_id AND h.status='pending')"
+    ):
+        issues.append(f"duty_without_pending:{row['duty_id']}")
     return issues

@@ -95,6 +95,10 @@ def set_subscription_active(connection: sqlite3.Connection, subscription_id: str
             raise CatalogError("subscription_missing", "订阅不存在")
         store.record_activity(connection, "subscription_state", "subscription", subscription_id, utc_now(),
                               {"active": active})
+        if active:
+            # 重新启用只影响覆盖关系：重排事件待办；不向历史观测回填接收义务
+            from . import events
+            events.arrange_all_duties(connection, utc_now())
     return subscription(connection, subscription_id)
 
 

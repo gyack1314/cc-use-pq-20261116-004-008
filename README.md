@@ -28,4 +28,32 @@ python -m orbitbridge --db work.sqlite3 verify
 
 `quality` 检查跨表不变量，`reconcile` 核对站点和订阅数量。`batch-report <编号>` 与 `day-report YYYY-MM-DD` 分别提供批次及日期统计。`export-handoffs <订阅编号> <新文件路径>` 导出交接来源并返回摘要，`export-check <文件路径> <摘要>` 校验文件。导出不会覆盖已有文件。
 
+## 火点事件聚合与拆分
+
+相邻站点的多条观测可能指向同一火点。系统在原始观测之上维护**事件层**，三条主线各自独立、全程留痕、只追加不删除：
+
+- **原始观测**（`observations`）与**逐观测接收义务**（`handoffs`）永久保留；覆盖关系变化时旧义务标记 `withdrawn` 而非删除。
+- **当前事件**（`events` + `event_memberships`）：每条观测收件时先建立单例事件，之后通过确认式聚合/拆分重组。成员的每次进入、离开都有时态记录，`event_lineage` 保存 `created/merged/split/corrected` 血缘。
+- **值守待办**（`event_duties` + `duty_observations`）：队列按「事件 × 订阅 × 代际」组织。定位修正、订阅停用/重启用或拆分改变覆盖关系时，旧的未决代际标记 `superseded` 并按当前覆盖重新安排；已确认代际作为责任历史保留。
+
+聚合与拆分采用**提案—确认**两阶段，必须由操作人显式确认才生效：
+
+```text
+python -m orbitbridge --db work.sqlite3 events
+python -m orbitbridge --db work.sqlite3 propose-merge 3 5 --operator 值守班长 --reason "同一火点"
+python -m orbitbridge --db work.sqlite3 proposals
+python -m orbitbridge --db work.sqlite3 proposal-confirm 1 --operator 值守班长
+python -m orbitbridge --db work.sqlite3 propose-split 3 --group 1 2 --group 3 --operator 值守班长 --reason "两个火点"
+python -m orbitbridge --db work.sqlite3 proposal-cancel 2 --operator 值守班长
+python -m orbitbridge --db work.sqlite3 event 3
+```
+
+确认待办用 `ack-duty <待办编号> <操作人>`。确认只覆盖该代际快照中当时所列的来源；后来并入同一事件的观测若仍有未履行义务，会产生**新一代 pending 待办**，不会被旧确认自动覆盖。快照中 `was_pending=0` 的行表示该来源在本代际建立时已经确认过。
+
+区域订阅以自己**实际覆盖的来源**判断应收事件：待办快照逐观测按订阅区域与阈值过滤，跨区合并后一个组看不到无权接收的来源，另一组的接收义务也不会因合并消失。`correct-observation <观测编号>` 可修正区域或坐标（原值写入 `observation_corrections`）；区域变化会撤销失去覆盖的旧义务、为新覆盖建立新义务并重排待办。
+
+收件重放（同包再次导入）仍返回 `duplicate`，回到观测的**当前事件**，不会重建历史聚合。两条已分别确认的事件再合并时，各自的确认代际与操作人历史完整保留，可在 `event <编号>` 的 `duties` 与血缘中追溯。
+
+`duties` 查看事件待办（可按订阅、事件、状态过滤），`duty <编号>` 查看来源快照，`event-overview` 分别给出原始观测数、当前/已归并事件数、交接义务（pending/acknowledged/withdrawn）及每组未履行义务数。数量核对不靠删除记录压低重复数：`reconcile` 的 `events` 段校验当前事件成员总数恒等于原始观测总数，并报告未路由到任何待办的未履行义务。
+
 测试：`python -m unittest discover -s tests -v`。语法检查：`python -m compileall -q orbitbridge`。

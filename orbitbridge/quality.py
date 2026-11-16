@@ -43,14 +43,50 @@ def check_all(connection: sqlite3.Connection) -> dict[str, Any]:
                                   "JOIN observations o USING(observation_id) JOIN subscriptions s USING(subscription_id) "
                                   "JOIN batches b ON b.batch_id=o.batch_id"):
         identifier = str(row["handoff_id"])
+        if row["status"] == "withdrawn":
+            # 撤销是覆盖变化的留痕，不再要求满足当前订阅条件；义务并未被删除
+            continue
+        if row["status"] == "acknowledged":
+            # 已确认是不可变的历史责任快照，只校验时间合理性，不按当前区域/阈值追溯
+            if row["acknowledged_at"] < row["created_at"]:
+                issue("ack_before_create", "handoff", identifier, "确认时间早于交接创建时间")
+            continue
         if row["region"] != row["subscription_region"]:
             issue("region_mismatch", "handoff", identifier, "交接区域与订阅区域不符")
         if row["severity"] < row["minimum_severity"] or Decimal(row["confidence"]) < Decimal(row["minimum_confidence"]):
             issue("threshold_mismatch", "handoff", identifier, "交接项不满足订阅阈值")
         if row["created_at"] < row["received_at"]:
             issue("created_before_batch", "handoff", identifier, "交接时间早于批次接收时间")
-        if row["status"] == "acknowledged" and row["acknowledged_at"] < row["created_at"]:
-            issue("ack_before_create", "handoff", identifier, "确认时间早于交接创建时间")
+    # 事件层：每条观测恰好有一个当前 active 事件
+    for row in connection.execute(
+        "SELECT o.observation_id FROM observations o WHERE NOT EXISTS("
+        "SELECT 1 FROM event_memberships m JOIN events e ON e.event_id=m.event_id AND e.status='active' "
+        "WHERE m.observation_id=o.observation_id AND m.change_type='joined' AND NOT EXISTS("
+        "SELECT 1 FROM event_memberships x WHERE x.observation_id=m.observation_id "
+        "AND x.change_type='left' AND x.membership_id>m.membership_id))"
+    ):
+        issue("orphan_observation", "observation", str(row["observation_id"]), "观测没有当前事件归属")
+    for row in connection.execute(
+        "SELECT observation_id,COUNT(*) AS current_count FROM ("
+        "SELECT m.observation_id,m.event_id FROM event_memberships m WHERE m.change_type='joined' AND NOT EXISTS("
+        "SELECT 1 FROM event_memberships x WHERE x.observation_id=m.observation_id "
+        "AND x.change_type='left' AND x.membership_id>m.membership_id)) GROUP BY observation_id HAVING current_count>1"
+    ):
+        issue("duplicate_membership", "observation", str(row["observation_id"]), "观测同时属于多个事件")
+    # 启用订阅的每条 pending 义务都必须被某个 pending 待办覆盖（未履行义务不得失踪）
+    for row in connection.execute(
+        "SELECT h.handoff_id FROM handoffs h JOIN subscriptions s USING(subscription_id) "
+        "WHERE h.status='pending' AND s.active=1 AND NOT EXISTS("
+        "SELECT 1 FROM duty_observations do2 JOIN event_duties d ON d.duty_id=do2.duty_id "
+        "WHERE do2.handoff_id=h.handoff_id AND d.status='pending')"
+    ):
+        issue("unrouted_obligation", "handoff", str(row["handoff_id"]), "未履行义务缺少当前待办")
+    # pending 待办快照中不得残留已撤销义务
+    for row in connection.execute(
+        "SELECT do2.duty_id FROM duty_observations do2 JOIN event_duties d ON d.duty_id=do2.duty_id "
+        "JOIN handoffs h ON h.handoff_id=do2.handoff_id WHERE d.status='pending' AND h.status='withdrawn'"
+    ):
+        issue("stale_duty_snapshot", "duty", str(row["duty_id"]), "待办快照包含已撤销义务")
     return {"ok": not issues, "issues": issues, "counts": store.counts(connection)}
 
 

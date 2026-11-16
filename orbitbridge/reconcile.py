@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from . import catalog, store
+from . import catalog, events, store
 
 
 class ReconcileError(ValueError):
@@ -78,10 +78,32 @@ def day_counts(connection: sqlite3.Connection, day: str) -> dict[str, Any]:
             "handoff_count": sum(row["handoffs"] for row in handoffs)}
 
 
+def event_counts(connection: sqlite3.Connection) -> dict[str, Any]:
+    """三层数量分别解释：原始观测（只增不删）、当前事件、每组未履行义务。"""
+    overview = events.event_overview(connection)
+    gaps = events.find_duty_gaps(connection)
+    # 当前事件成员数之和必须等于原始观测总数（每条观测恰在一个 active 事件中）
+    current_members = connection.execute(
+        "SELECT COUNT(*) FROM event_memberships m WHERE m.change_type='joined' AND NOT EXISTS("
+        "SELECT 1 FROM event_memberships x WHERE x.observation_id=m.observation_id "
+        "AND x.change_type='left' AND x.membership_id>m.membership_id)").fetchone()[0]
+    raw_observations = connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    return {"raw_observation_count": raw_observations,
+            "current_event_members": int(current_members),
+            "active_events": overview["active_events"], "absorbed_events": overview["absorbed_events"],
+            "total_events": overview["total_events"],
+            "handoffs": {"pending": overview["pending_handoffs"], "acknowledged": overview["acknowledged_handoffs"],
+                         "withdrawn": overview["withdrawn_handoffs"], "total": overview["total_handoffs"]},
+            "pending_duties": overview["pending_duties"],
+            "unrouted_obligations": gaps,
+            "balanced": int(current_members) == int(raw_observations) and not gaps}
+
+
 def full_reconciliation(connection: sqlite3.Connection) -> dict[str, Any]:
     stations = [station_counts(connection, row["station_id"]) for row in catalog.list_stations(connection)]
     subscriptions = [subscription_counts(connection, row["subscription_id"])
                      for row in catalog.list_subscriptions(connection)]
+    event_view = event_counts(connection)
     problems = []
     for item in stations:
         if not item["balanced"]:
@@ -89,5 +111,7 @@ def full_reconciliation(connection: sqlite3.Connection) -> dict[str, Any]:
     for item in subscriptions:
         if not item["balanced"]:
             problems.append({"kind": "subscription", "id": item["subscription"]["subscription_id"]})
+    if not event_view["balanced"]:
+        problems.append({"kind": "events", "id": "event-layer"})
     return {"ok": not problems, "stations": stations, "subscriptions": subscriptions,
-            "problems": problems}
+            "events": event_view, "problems": problems}

@@ -5,7 +5,7 @@ import json
 import sqlite3
 from typing import Any
 
-from . import catalog, handoff, store
+from . import catalog, events, handoff, store
 
 
 class AuditError(ValueError):
@@ -135,11 +135,12 @@ def summary(connection: sqlite3.Connection) -> dict[str, Any]:
 
 def verify_lineage(connection: sqlite3.Connection) -> list[str]:
     issues = store.integrity_check(connection)
-    for row in connection.execute("SELECT h.handoff_id,h.created_at,b.received_at,o.region,s.region AS subscription_region "
-                                  "FROM handoffs h JOIN observations o USING(observation_id) "
+    for row in connection.execute("SELECT h.handoff_id,h.created_at,b.received_at,o.region,s.region AS subscription_region,"
+                                  "h.status FROM handoffs h JOIN observations o USING(observation_id) "
                                   "JOIN batches b ON b.batch_id=o.batch_id "
                                   "JOIN subscriptions s USING(subscription_id)"):
-        if row["region"] != row["subscription_region"]:
+        # 已确认是历史责任快照、已撤销是覆盖变化留痕：均不按当前区域追溯
+        if row["status"] == "pending" and row["region"] != row["subscription_region"]:
             issues.append(f"region_mismatch:{row['handoff_id']}")
         if row["created_at"] < row["received_at"]:
             issues.append(f"handoff_before_batch:{row['handoff_id']}")
@@ -147,4 +148,6 @@ def verify_lineage(connection: sqlite3.Connection) -> list[str]:
                                   "FROM batches b JOIN station_cursors c USING(station_id)"):
         if row["sequence"] > row["committed_sequence"]:
             issues.append(f"uncommitted_batch:{row['batch_id']}")
+    for gap in events.find_duty_gaps(connection):
+        issues.append(f"unrouted_obligation:{gap['handoff_id']}")
     return issues
